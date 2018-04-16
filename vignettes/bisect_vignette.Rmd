@@ -1,0 +1,162 @@
+---
+title: "BiSect: Infering Cell Type Compositon"
+author: "Eyal Fisher"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+bibliography: ../tools/bibliography.bib
+vignette: >
+  %\VignetteIndexEntry{BiSect: Infering Cell Type Compositon}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+When conducting Epigenome Wide Association Studies (EWAS) on methylation data, it is important to account for the cell type heterogeneity in the samples,
+as failing to do so can result in biases and false positives. 
+A common and simple way to do so, is the inclusion of the cell type composition of each sample as covariate in the linear model used for the EWAS.
+BiSect is an accurate method for inferring the cell compositon of samples from their methylation data. It is specifically taylored to work on methylation sequencing data, and therefore provides calibrated estimates even in low-coverage setting. 
+This package implements two modes, a *supervised mode*, for estimating the cell composition using a reference that contains the probability for methylation in each isolated cell type (a reference for blood samples is provided), and an *unsupervised mode*, that estimates the reference, but requires the cell composition for a subset of the samples. 
+
+## Supervised Mode: Using a Reference
+
+Using the supervised mode is pretty straight forward. First, we need two matrices: one with the number of methylated reads, and one with the number of total reads, for each sample and each site. This example was subsampled from array data provided in @hannum_genome-wide_2013.
+The rows are samples and the columns are CpG sites:
+```{r}
+library(bisect)
+
+methylation <- as.matrix(methylation_GSE40279)
+total_reads <- as.matrix(total_reads_GSE40279)
+
+dim(methylation)
+dim(total_reads)
+
+total_reads_GSE40279[1:10, 1:5]
+```
+
+We also need a reference with the proabability for methylation in each site, in each pure cell type. Here we used the reference of @koestler_improving_2016. 
+
+```{r}
+dim(reference_blood)
+reference_blood[1:10, ]
+
+Pi <- as.matrix(reference_blood[,-1]) # For running Bisect we don't need the cg IDs, and we need the reference as a matrix.
+```
+
+Notice that we have one the sites in the three matrices (methylation, total_reads and the reference) need to appear in the same order. 
+
+The last optional thing is the hyper-parameters for the prior dirichlet distribution imposed on the cell types proportions. We provide recommended values for blood samples and the above cell types that were estimated by fitting a dirichlet distribution to cell counts data.
+
+```{r}
+print(alpha_blood)
+```
+
+Now we are ready to run bisect:
+```{r, cache=T}
+results <- bisect_supervised(methylation, total_reads, Pi, alpha_blood, iterations = 200)
+
+head(results)
+``` 
+
+Before subsampling the dataset of Hahnum el al. we used the method by @houseman_dna_2012 to estimate the cell composition from the array data. Because array data contains many thausands of probes at each site, the estimate is fairly accurate. Now we can compare the results of BiSect to a baseline:
+
+```{r, fig.width=7}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# organizing the results to a data.frame that works with ggplot2
+get_visualization_dataframe <- function(bisect_results, true_cell_counts) {
+    estimates_bin <- as.data.frame(bisect_results)
+    true_cell_counts <- as.data.frame(true_cell_counts)
+
+    colnames(estimates_bin) <- c("CD4", "CD8", "mono", "Bcells", "NK", "gran")
+    colnames(true_cell_counts) <- c("CD4", "CD8", "mono", "Bcells", "NK", "gran")
+
+    gathered_estimates_bin <- estimates_bin %>% gather("CD4", "CD8", "mono", "Bcells", "NK", "gran", key = "cell_type", value = "estimate_norm")
+    gathered_truth <- true_cell_counts %>% gather("CD4", "CD8", "mono", "Bcells", "NK", "gran", key = "cell_type", value = "truth")
+
+    gathered_estimates_bin <- gathered_estimates_bin %>% mutate(method = "bin")
+    colnames(gathered_estimates_bin) <- c("cell_type", "estimate", "method")
+
+    estimates <- rbind(gathered_estimates_bin)
+    truth <- rbind(gathered_truth, gathered_truth)
+
+    results <- cbind(truth, select(estimates, "estimate", "method"))
+
+    return(results)
+}
+
+visualization_result <- get_visualization_dataframe(results, baseline_GSE40279)
+
+# plot a scatter plot of true cell types vs estimated.  Looks pretty good!
+visualization_result %>% ggplot(aes(truth, estimate, color=cell_type)) + geom_point(size=0.2, alpha = 0.4) + 
+  geom_abline(intercept = 0, slope = 1) + xlab("True Cell Proportion") + ylab("Estimated Cell Proportion") + 
+  guides(colour = guide_legend(override.aes = list(size=10))) + scale_color_discrete(name = "Cell Type")
+``` 
+
+
+## Semi-Supervised Mode: Using a Sub-Sample With Known Cell Composition
+
+Using the semi-supervised mode is pretty straight-forward as well, only this time we need 5 matrices: the methylated and total reads for the samples with unknown cell composition, the same two matrices for the samples with known cell composition, and the matrix of cell composition, for the samples for whom it is known.
+
+For the purpose of this tutorial we will simply use a randomly selected subset of the samples in GSE40279 to use as known samples.
+First, we choose the random samples:
+```{r}
+set.seed(4321)
+
+# Choose 50 random individuals with known cell type composition
+n_known_samples <- 50
+known_samples_indices <- sample.int(nrow(baseline_GSE40279), size = n_known_samples)   
+known_samples <- as.matrix(baseline_GSE40279[known_samples_indices, ])
+```
+
+
+Now we can fit a Dirichlet distribution to them, to be used as a prior for the rest of the samples:
+```{r}
+# Fit a dirichlet distirbutio nto the known samples to use as a prior
+fit_dirichlet <- sirt::dirichlet.mle(as.matrix(known_samples))
+alpha <- fit_dirichlet$alpha
+```
+
+And all that is left is to seperate the methylated and total reads matrices and run bisect:
+```{r}
+# Organize all the matrices such that the known samples are the first 50 rows.
+methylation_known <- methylation_GSE40279[known_samples_indices, ]
+methylation_unknown <-methylation_GSE40279[-known_samples_indices, ]
+total_known <- total_reads_GSE40279[known_samples_indices, ]
+total_unknown <- total_reads_GSE40279[-known_samples_indices, ]
+
+# Run Bisect, making sure to supply the number of known individuals.
+results <- bisect_semi_suprevised(methylation_unknown, total_unknown, methylation_known, total_known, known_samples, alpha, iterations = 200)
+```
+
+This time results is a list containing both the cell type estimates for the unknown samples, and the estimated reference. Let us plot the estimated cell types against our full baseline:
+
+```{r, fig.width=7}
+library(ggplot2)
+
+visualization_result <- get_visualization_dataframe(results$P, baseline_GSE40279[-known_samples_indices,])
+
+# plot a scatter plot of true cell types vs estimated.  Looks pretty good!
+visualization_result %>% ggplot(aes(truth, estimate, color=cell_type)) + geom_point(size=0.2, alpha = 0.4) + 
+  geom_abline(intercept = 0, slope = 1) + xlab("True Cell Proportion") + ylab("Estimated Cell Proportion") + 
+  guides(colour = guide_legend(override.aes = list(size=10))) + scale_color_discrete(name = "Cell Type")
+```
+
+And we can also take a look at our estimate for the reference:
+```{r}
+estimated_reference <- results$Pi
+
+head(estimated_reference)
+
+# mean correlation between change of methylation and real change of mehylation.
+mean(diag(cor(estimated_reference, reference_blood[,-1])))
+```
+
+# References
